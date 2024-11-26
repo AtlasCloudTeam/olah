@@ -31,6 +31,7 @@ from olah.proxy.commits import commits_generator
 from olah.proxy.pathsinfo import pathsinfo_generator
 from olah.proxy.tree import tree_generator
 from olah.utils.disk_utils import convert_bytes_to_human_readable, convert_to_bytes, get_folder_size, sort_files_by_access_time, sort_files_by_modify_time, sort_files_by_size
+from olah.utils.location_utils import parse_location, generate_location
 from olah.utils.url_utils import clean_path
 from olah.utils.zip_utils import decompress_data
 
@@ -65,7 +66,7 @@ from olah.utils.repo_utils import (
     get_newest_commit_hf,
     parse_org_repo,
 )
-from olah.constants import REPO_TYPES_MAPPING
+from olah.constants import REPO_TYPES_MAPPING, WORKER_API_TIMEOUT
 from olah.utils.logging import build_logger
 
 logger = None
@@ -260,6 +261,122 @@ async def meta_proxy_common(repo_type: str, org: str, repo: str, commit: str, me
     except httpx.ConnectTimeout:
         traceback.print_exc()
         return Response(status_code=504)
+
+
+@app.head("/v2/{org}/{repo}/manifests/{tag}")
+@app.get("/v2/{org}/{repo}/manifests/{tag}")
+async def manifests(org, repo, tag: str, request: Request):
+    try:
+        resp = await meta_proxy_common(
+            repo_type="models",
+            org=org,
+            repo=repo,
+            commit="main",
+            method=request.method.lower(),
+            authorization=request.headers.get("authorization", None),
+        )
+        if resp.status_code != 200:
+            return Response(status_code=resp.status_code, content=resp.content, headers=resp.headers)
+
+        if tag is None or tag == "" or tag == "main":
+            tag = "latest"
+
+        url = urljoin(app.app_settings.config.hf_url_base(), f'/v2/{org}/{repo}/manifests/{tag}')
+        new_headers = {k.lower(): v for k, v in request.headers.items()}
+        new_headers["host"] = app.app_settings.config.hf_netloc
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=new_headers, timeout=WORKER_API_TIMEOUT)
+        return Response(status_code=response.status_code, content=response.content, headers=response.headers)
+
+    except httpx.RequestError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.head("/v2/{org}/{repo}/blobs/{digest}")
+async def blobs(org, repo, digest: str, request: Request):
+    try:
+        url = urljoin(app.app_settings.config.hf_url_base(), f'/v2/{org}/{repo}/blobs/{digest}')
+        new_headers = {k.lower(): v for k, v in request.headers.items()}
+        new_headers["host"] = app.app_settings.config.hf_netloc
+
+        async with httpx.AsyncClient() as client:
+            response = await client.head(url, headers=new_headers, timeout=WORKER_API_TIMEOUT)
+            status_code = response.status_code
+            if status_code < 300 or status_code >= 400:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            location = response.headers.get("location", None)
+            if location is None:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            info = parse_location(location)
+
+            if info is None:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            if info['org'] != org or info['repo'] != repo:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            return await file_head_common(
+                repo_type="models",
+                org=org,
+                repo=repo,
+                commit=info["commit"],
+                file_path=info["file_path"],
+                request=request,
+            )
+    except httpx.RequestError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/v2/{org}/{repo}/blobs/{digest}")
+async def blobs(org, repo, digest: str, request: Request):
+    try:
+        url = urljoin(app.app_settings.config.hf_url_base(), f'/v2/{org}/{repo}/blobs/{digest}')
+        new_headers = {k.lower(): v for k, v in request.headers.items()}
+        new_headers["host"] = app.app_settings.config.hf_netloc
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=new_headers, timeout=WORKER_API_TIMEOUT, follow_redirects=False)
+            status_code = response.status_code
+            if status_code < 300 or status_code >= 400:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            location = response.headers.get("location", None)
+            if location is None:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            if status_code == 307:
+                status_code = 200
+
+            info = parse_location(location)
+
+            if info is None:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            if info['org'] != org or info['repo'] != repo:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            resp = await file_head_common(
+                repo_type="models",
+                org=org,
+                repo=repo,
+                commit=info["commit"],
+                file_path=info["file_path"],
+                request=request,
+            )
+            new_commit = resp.headers.get("x-repo-commit", None)
+            if new_commit is None:
+                return Response(status_code=status_code, content=response.content, headers=response.headers)
+
+            resp_headers = {k.lower(): v for k, v in response.headers.items()}
+            resp_headers["location"] = generate_location(org, repo, new_commit, info["file_path"])
+
+        return Response(status_code=status_code, content=response.content, headers=resp_headers)
+
+    except httpx.RequestError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.head("/api/{repo_type}/{org_repo}")
